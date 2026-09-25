@@ -1,8 +1,8 @@
 import { WebSocketServer } from 'ws';
-import { mongoDb, redisClient, firebaseAdmin, supabase, supabaseAdmin } from '../config/db.js';
-import jwt from 'jsonwebtoken';
-import logger from '../middleware/logger.js';
 import crypto from 'crypto';
+import jwt from 'jsonwebtoken';
+import { mongoDb, redisClient, firebaseAdmin, supabase, supabaseAdmin } from '../config/db.js';
+import logger from '../middleware/logger.js';
 import { createLocationEventBus } from './locationEventBus.js';
 import telemetryBuffer from './telemetryBuffer.js';
 import GpsLog from '../models/GpsLog.js';
@@ -10,6 +10,9 @@ import { scheduleEtaRecalculationOnLocationUpdate } from '../services/order/etaS
 import DeliveryDelayService from '../services/order/deliveryDelayService.js';
 import { calculateAdaptiveInterval, getQueueDepth } from './adaptivePoller.js';
 
+// =====================================================================
+// SCHEMA & VALIDATION DEFINITIONS
+// =====================================================================
 const TELEMETRY_SCHEMA = {
   lat: { type: 'number', required: false, min: -90, max: 90 },
   lng: { type: 'number', required: false, min: -180, max: 180 },
@@ -26,10 +29,9 @@ const TELEMETRY_SCHEMA = {
 
 function validateTelemetryPayload(data) {
   const errors = [];
-
   const hasLatLng = data.lat !== undefined && data.lat !== null && data.lng !== undefined && data.lng !== null;
   const hasLatLong = data.latitude !== undefined && data.latitude !== null && data.longitude !== undefined && data.longitude !== null;
-  
+
   if (!hasLatLng && !hasLatLong) {
     errors.push('At least one coordinate pair (lat/lng or latitude/longitude) is required');
   }
@@ -66,28 +68,182 @@ function sanitizeTelemetryData(data) {
   return sanitized;
 }
 
-let _orderRepository = null;
-let _deliveryDelayService = null;
+// =====================================================================
+// CONFIGURATION & CONSTANTS
+// =====================================================================
+export const CLOCK_SKEW_TOLERANCE_MS = parseInt(process.env.CLOCK_SKEW_TOLERANCE_MS, 10) || 300000;
+const MAX_CONSECUTIVE_DROPS = 10;
+const TRACKER_DRIVER_STATE_TTL_MS = parseInt(process.env.TRACKER_DRIVER_STATE_TTL_MS, 10) || 900000;
+const DRIVER_STATE_SWEEP_INTERVAL_MS = parseInt(process.env.DRIVER_STATE_SWEEP_INTERVAL_MS, 10) || 60000;
+const HEARTBEAT_INTERVAL_MS = parseInt(process.env.WS_HEARTBEAT_INTERVAL_MS, 10) || 180000;
 
-// In-memory mapping of active client subscriptions (process-local by design;
-// distributed fan-out across replicas is handled by the locationEventBus).
-let trackingSubscriptions = new Map();
+const WS_UPGRADE_RATE_LIMIT = 5;
+const WS_UPGRADE_RATE_WINDOW_SECONDS = 60;
+const MAX_MSG_PER_SECOND = 10;
+const WS_MAX_PAYLOAD_BYTES = parseInt(process.env.WS_MAX_PAYLOAD_BYTES, 10) || 4096;
+const WS_AUTH_TIMEOUT_MS = 10000;
+const WS_UPGRADE_LIMITS_SWEEP_INTERVAL_MS = 30000;
 
-// Dedicated Redis subscriber instance for multi-replica WebSocket broadcasting
-let redisSubClient = null;
+const GPS_LOG_RETRY_DELAYS_MS = [100, 200, 400];
+const GPS_LOG_MAX_RETRIES = 5;
+const GPS_LOG_DLQ_KEY = 'gps_log_dlq';
+
+const DRIVER_ORDER_CACHE_TTL_SECONDS = 60;
+const DRIVER_ORDER_CACHE_KEY_PREFIX = 'driver:active-order:';
+
 const TRACKER_CHANNELS = {
   LOCATION: 'tracker:location_updates',
   MILESTONE: 'tracker:milestone_updates',
   ETA: 'tracker:eta_updates',
 };
 
+// =====================================================================
+// STATE MANAGEMENT & CACHES
+// =====================================================================
+let _orderRepository = null;
+let _deliveryDelayService = null;
+let trackingSubscriptions = new Map();
+let redisSubClient = null;
+const locationChannels = new Map();
+const displayIdToLocationChannelKeys = new Map();
+const driverToLocationChannels = new Map();
+let locationEventBus = null;
+
+const consecutiveDropCount = new Map();
+let lastDriverStateSweep = 0;
+
+let isSchedulerActive = false;
+let telemetryFlushTimeout = null;
+let wsServer = null;
+let wsHeartbeatInterval = null;
+let telemetryMonitorInterval = null;
+let driverStateSweepInterval = null;
+let wsUpgradeLimitsCleanupInterval = null;
+let messageRateTrackerCleanupInterval = null;
+
+const messageRateTracker = new Map();
+const wsUpgradeMemoryLimits = new Map();
+
+// =====================================================================
+// HELPER & UTILITY FUNCTIONS
+// =====================================================================
+function sweepStaleDriverState(now) {
+  if (now - lastDriverStateSweep < DRIVER_STATE_SWEEP_INTERVAL_MS) return;
+  lastDriverStateSweep = now;
+  for (const [driverId, entry] of consecutiveDropCount) {
+    if (now - entry.lastUpdated > TRACKER_DRIVER_STATE_TTL_MS) {
+      consecutiveDropCount.delete(driverId);
+    }
+  }
+}
+
+async function getCachedDriverOrder(driverId) {
+  if (!driverId || !redisClient) return null;
+  try {
+    const cached = await redisClient.get(`${DRIVER_ORDER_CACHE_KEY_PREFIX}${driverId}`);
+    return cached ? JSON.parse(cached) : null;
+  } catch (err) {
+    logger.error({ err, driverId }, 'Redis driver order cache get error');
+    return null;
+  }
+}
+
+async function setCachedDriverOrder(driverId, orderId, orderDisplayId) {
+  if (!driverId || !redisClient || !orderId) return;
+  try {
+    await redisClient.set(
+      `${DRIVER_ORDER_CACHE_KEY_PREFIX}${driverId}`,
+      JSON.stringify({ orderId, orderDisplayId }),
+      'EX',
+      DRIVER_ORDER_CACHE_TTL_SECONDS
+    );
+  } catch (err) {
+    logger.error({ err, driverId }, 'Redis driver order cache set error');
+  }
+}
+
+async function invalidateDriverOrderCache(driverId) {
+  if (!driverId || !redisClient) return;
+  try {
+    await redisClient.del(`${DRIVER_ORDER_CACHE_KEY_PREFIX}${driverId}`);
+  } catch (err) {
+    logger.error({ err, driverId }, 'Redis driver order cache invalidate error');
+  }
+}
+
+export function getClientIp(request) {
+  return request.socket?.remoteAddress || request.connection?.remoteAddress || 'unknown';
+}
+
+function enforceWsUpgradeMemoryLimit(ipAddress) {
+  const now = Date.now();
+  const windowMs = WS_UPGRADE_RATE_WINDOW_SECONDS * 1000;
+  let entry = wsUpgradeMemoryLimits.get(ipAddress);
+  if (!entry || now >= entry.resetAt) {
+    entry = { count: 0, resetAt: now + windowMs };
+    wsUpgradeMemoryLimits.set(ipAddress, entry);
+  }
+  entry.count++;
+  if (wsUpgradeMemoryLimits.size > 10000) {
+    for (const [key, e] of wsUpgradeMemoryLimits) {
+      if (now >= e.resetAt) wsUpgradeMemoryLimits.delete(key);
+    }
+  }
+  return entry.count <= WS_UPGRADE_RATE_LIMIT;
+}
+
+function sweepWsUpgradeMemoryLimits() {
+  const now = Date.now();
+  for (const [key, e] of wsUpgradeMemoryLimits) {
+    if (now >= e.resetAt) wsUpgradeMemoryLimits.delete(key);
+  }
+}
+
+export async function isWebSocketUpgradeAllowed(request) {
+  const ipAddress = getClientIp(request);
+  const key = `ws:upgrade:${ipAddress}`;
+
+  if (!redisClient) {
+    return enforceWsUpgradeMemoryLimit(ipAddress);
+  }
+
+  try {
+    const attempts = await redisClient.incr(key);
+    if (attempts === 1 || (await redisClient.ttl(key)) === -1) {
+      await redisClient.expire(key, WS_UPGRADE_RATE_WINDOW_SECONDS);
+    }
+    return attempts <= WS_UPGRADE_RATE_LIMIT;
+  } catch (err) {
+    logger.error({ err }, 'Redis WebSocket upgrade rate limit error');
+    return enforceWsUpgradeMemoryLimit(ipAddress);
+  }
+}
+
+export function rejectWebSocketUpgrade(socket) {
+  socket.write('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n');
+  socket.destroy();
+}
+
+export function rejectConnectionWithTokenInUrl(ws, reqUrl) {
+  const urlToken = reqUrl.searchParams.get('token');
+  if (!urlToken) return false;
+  logger.warn({ event: 'WS_TOKEN_IN_URL' }, 'WebSocket auth token present in URL query string; refusing connection');
+  ws.send(JSON.stringify({
+    error: 'Unauthorized: auth token must not be sent in the URL query string',
+    code: 4001,
+  }));
+  ws.close(4001, 'Auth token must not be sent in the URL query string');
+  return true;
+}
+
+// =====================================================================
+// PUB/SUB & BROADCAST MANAGEMENT
+// =====================================================================
 function deliverToLocalSubscribers(targetId, payload) {
   if (!targetId || !trackingSubscriptions.has(targetId)) return;
   const clients = trackingSubscriptions.get(targetId);
   clients.forEach((client) => {
-    if (client.readyState === 1) {
-      client.send(payload);
-    }
+    if (client.readyState === 1) client.send(payload);
   });
 }
 
@@ -111,10 +267,7 @@ function initRedisTrackerPubSub() {
           const { orderDisplayId, driver_id, payload } = parsed;
           if (orderDisplayId) deliverToLocalSubscribers(orderDisplayId, payload);
           if (driver_id) deliverToLocalSubscribers(driver_id, payload);
-        } else if (channel === TRACKER_CHANNELS.MILESTONE) {
-          const { orderDisplayId, payload } = parsed;
-          if (orderDisplayId) deliverToLocalSubscribers(orderDisplayId, payload);
-        } else if (channel === TRACKER_CHANNELS.ETA) {
+        } else if (channel === TRACKER_CHANNELS.MILESTONE || channel === TRACKER_CHANNELS.ETA) {
           const { orderDisplayId, payload } = parsed;
           if (orderDisplayId) deliverToLocalSubscribers(orderDisplayId, payload);
         }
@@ -127,256 +280,72 @@ function initRedisTrackerPubSub() {
   }
 }
 
-
-// Cached Supabase Realtime channels keyed by orderUUID to avoid creating a new
-// channel per location ping. Reused across pings and cleaned up on disconnect.
-const locationChannels = new Map();
-
-// Reverse index from orderDisplayId to the set of orderUUID keys in locationChannels.
-// Used during disconnect cleanup so channels are properly removed when the last
-// subscriber for a display ID disconnects.
-const displayIdToLocationChannelKeys = new Map();
-
-// Reverse index from driverId to the set of orderUUID keys it is actively
-// publishing location channels for. Used to tear down channels when the
-// publishing driver disconnects, so driver-only / unsubscribed orders do not
-// leak a Supabase Realtime channel for the process lifetime.
-const driverToLocationChannels = new Map();
-
-// Redis Pub/Sub fan-out bus that distributes location events across API
-// replicas so a driver connected to Replica A reaches a customer connected to
-// Replica B. Local subscribers are still stored only in `trackingSubscriptions`;
-// the bus only relays validated events between processes.
-let locationEventBus = null;
-
-// =====================================================================
-// CLOCK SKEW & CIRCUIT BREAKER CONFIGURATION (#596)
-// =====================================================================
-export const CLOCK_SKEW_TOLERANCE_MS = parseInt(process.env.CLOCK_SKEW_TOLERANCE_MS, 10) || 300000; // default ±5 min
-const MAX_CONSECUTIVE_DROPS = 10;
-const consecutiveDropCount = new Map();
-
-// =====================================================================
-// DRIVER STATE TTL & LAZY CLEANUP
-// =====================================================================
-const TRACKER_DRIVER_STATE_TTL_MS = parseInt(process.env.TRACKER_DRIVER_STATE_TTL_MS, 10) || 900000; // default 15 min
-const DRIVER_STATE_SWEEP_INTERVAL_MS = parseInt(process.env.DRIVER_STATE_SWEEP_INTERVAL_MS, 10) || 60000; // default 1 min
-let lastDriverStateSweep = 0;
-
-function sweepStaleDriverState(now) {
-  // Clean up stale driver state periodically regardless of Map size to
-  // prevent unbounded memory growth from drivers who stop sending telemetry.
-  if (now - lastDriverStateSweep < DRIVER_STATE_SWEEP_INTERVAL_MS) return;
-  lastDriverStateSweep = now;
-  for (const [driverId, entry] of consecutiveDropCount) {
-    if (now - entry.lastUpdated > TRACKER_DRIVER_STATE_TTL_MS) {
-      consecutiveDropCount.delete(driverId);
-    }
-  }
+function buildClientLocationPayload({ driverId, orderDisplayId, lat, lng, speed, bearing, timestampIso }) {
+  return JSON.stringify({
+    event: 'location_update',
+    data: {
+      driver_id: driverId,
+      order_display_id: orderDisplayId,
+      latitude: lat,
+      longitude: lng,
+      speed,
+      bearing,
+      timestamp: timestampIso,
+    },
+  });
 }
 
-// =====================================================================
-// Telemetry persistence is delegated to the shared telemetryBuffer module
-// (./telemetryBuffer.js). Live broadcasting never waits on MongoDB.
-// =====================================================================
-let isSchedulerActive = false;
-let telemetryFlushTimeout = null;
-let wsServer = null;
-let wsHeartbeatInterval = null;
-let telemetryMonitorInterval = null;
-let driverStateSweepInterval = null;
-let wsUpgradeLimitsCleanupInterval = null;
-let messageRateTrackerCleanupInterval = null;
-const HEARTBEAT_INTERVAL_MS = parseInt(process.env.WS_HEARTBEAT_INTERVAL_MS, 10) || 180000; // 3 minutes
-
-const WS_UPGRADE_RATE_LIMIT = 5;
-const WS_UPGRADE_RATE_WINDOW_SECONDS = 60;
-const MAX_MSG_PER_SECOND = 10;
-const WS_MAX_PAYLOAD_BYTES = 4096;
-const messageRateTracker = new Map(); // socketId -> { count, windowStart }
-
-// Max time a socket may stay unauthenticated while awaiting a first-frame
-// `auth` message before it is closed (issue #5739).
-const WS_AUTH_TIMEOUT_MS = 10000;
-
-// =====================================================================
-// GPS LOG PERSISTENCE RETRY + DEAD-LETTER QUEUE (#11373)
-// =====================================================================
-// Exponential backoff between GpsLog.create attempts (max 3 attempts).
-const GPS_LOG_RETRY_DELAYS_MS = [100, 200, 400];
-// Max times a DLQ entry is re-enqueued for replay before being dropped.
-const GPS_LOG_MAX_RETRIES = 5;
-const GPS_LOG_DLQ_KEY = 'gps_log_dlq';
-
-// =====================================================================
-// DRIVER → ORDER CACHE (performance: avoid repeated Supabase lookups)
-// =====================================================================
-const DRIVER_ORDER_CACHE_TTL_SECONDS = 60;
-const DRIVER_ORDER_CACHE_KEY_PREFIX = 'driver:active-order:';
-
-/**
- * Retrieve the cached active order mapping for a driver.
- * Returns { orderId, orderDisplayId } or null on miss / error.
- */
-async function getCachedDriverOrder(driverId) {
-  if (!driverId) return null;
-  if (!redisClient) return null;
-  try {
-    const cached = await redisClient.get(`${DRIVER_ORDER_CACHE_KEY_PREFIX}${driverId}`);
-    if (cached) {
-      return JSON.parse(cached);
-    }
-  } catch (err) {
-    logger.error({ err, driverId }, 'Redis driver order cache get error');
-  }
-  return null;
+function buildClientPayloadFromInternalEvent(event) {
+  return buildClientLocationPayload({
+    driverId: event.driverId,
+    orderDisplayId: event.orderDisplayId,
+    lat: event.location.lat,
+    lng: event.location.lng,
+    speed: event.location.speed,
+    bearing: event.location.bearing,
+    timestampIso: event.timestamp,
+  });
 }
 
-/**
- * Store the driver → active order mapping in Redis.
- */
-async function setCachedDriverOrder(driverId, orderId, orderDisplayId) {
-  if (!driverId) return;
-  if (!redisClient || !orderId) return;
-  try {
-    await redisClient.set(
-      `${DRIVER_ORDER_CACHE_KEY_PREFIX}${driverId}`,
-      JSON.stringify({ orderId, orderDisplayId }),
-      'EX',
-      DRIVER_ORDER_CACHE_TTL_SECONDS,
-    );
-  } catch (err) {
-    logger.error({ err, driverId }, 'Redis driver order cache set error');
-  }
-}
+function deliverLocationToLocalSubscribers(subscriptionMap, payload, orderDisplayId, driverId, metricsBus) {
+  const bus = metricsBus || locationEventBus;
+  const deliveredSockets = new Set();
+  let delivered = 0;
 
-/**
- * Invalidate cached active order for a driver.
- */
-async function invalidateDriverOrderCache(driverId) {
-  if (!driverId) return;
-  if (!redisClient) return;
-  try {
-    await redisClient.del(`${DRIVER_ORDER_CACHE_KEY_PREFIX}${driverId}`);
-  } catch (err) {
-    logger.error({ err, driverId }, 'Redis driver order cache invalidate error');
-  }
-}
-
-function getClientIp(request) {
-  // Trust only the TCP peer address. The X-Forwarded-For header is
-  // client-controlled and can be spoofed to rotate the per-IP rate-limit
-  // key and bypass the limit entirely (issue #5828).
-  return request.socket?.remoteAddress || request.connection?.remoteAddress || 'unknown';
-}
-
-export { getClientIp };
-
-// Process-local fallback counter for the per-IP upgrade limit, used when Redis
-// is unavailable so the limit is still enforced instead of failing open.
-const wsUpgradeMemoryLimits = new Map();
-
-function enforceWsUpgradeMemoryLimit(ipAddress) {
-  const now = Date.now();
-  const windowMs = WS_UPGRADE_RATE_WINDOW_SECONDS * 1000;
-  let entry = wsUpgradeMemoryLimits.get(ipAddress);
-  if (!entry || now >= entry.resetAt) {
-    entry = { count: 0, resetAt: now + windowMs };
-    wsUpgradeMemoryLimits.set(ipAddress, entry);
-  }
-  entry.count++;
-  if (wsUpgradeMemoryLimits.size > 10000) {
-    for (const [key, e] of wsUpgradeMemoryLimits) {
-      if (now >= e.resetAt) wsUpgradeMemoryLimits.delete(key);
-    }
-  }
-  return entry.count <= WS_UPGRADE_RATE_LIMIT;
-}
-
-const WS_UPGRADE_LIMITS_SWEEP_INTERVAL_MS = 30000;
-
-// Periodically purge expired per-IP upgrade-limit entries so the in-memory
-// fallback map does not grow unbounded during a Redis outage.
-function sweepWsUpgradeMemoryLimits() {
-  const now = Date.now();
-  for (const [key, e] of wsUpgradeMemoryLimits) {
-    if (now >= e.resetAt) wsUpgradeMemoryLimits.delete(key);
-  }
-}
-
-export async function isWebSocketUpgradeAllowed(request) {
-  const ipAddress = getClientIp(request);
-  const key = `ws:upgrade:${ipAddress}`;
-
-  if (!redisClient) {
-    return enforceWsUpgradeMemoryLimit(ipAddress);
-  }
-
-  try {
-    const attempts = await redisClient.incr(key);
-
-    if (attempts === 1) {
-      await redisClient.expire(key, WS_UPGRADE_RATE_WINDOW_SECONDS);
-    } else {
-      const ttl = await redisClient.ttl(key);
-      if (ttl === -1) {
-        await redisClient.expire(key, WS_UPGRADE_RATE_WINDOW_SECONDS);
+  const targets = [orderDisplayId, driverId].filter(Boolean);
+  for (const target of targets) {
+    if (subscriptionMap.has(target)) {
+      for (const client of subscriptionMap.get(target)) {
+        if (client.readyState === 1 && !deliveredSockets.has(client)) {
+          deliveredSockets.add(client);
+          client.send(payload);
+          delivered++;
+        }
       }
     }
-
-    return attempts <= WS_UPGRADE_RATE_LIMIT;
-  } catch (err) {
-    logger.error({ err }, 'Redis WebSocket upgrade rate limit error');
-    return enforceWsUpgradeMemoryLimit(ipAddress);
   }
+
+  bus?.recordDelivery(delivered);
+  return delivered;
 }
 
-export function rejectWebSocketUpgrade(socket) {
-  socket.write(
-    'HTTP/1.1 429 Too Many Requests\r\n' +
-    'Connection: close\r\n' +
-    '\r\n'
-  );
-  socket.destroy();
+function createLocationEventHandler(targetBus, subscriptionMap) {
+  return (event) => {
+    const bus = targetBus || locationEventBus;
+    if (!bus || event.sourceInstanceId === bus.getInstanceId()) return;
+
+    const payload = buildClientPayloadFromInternalEvent(event);
+    const map = subscriptionMap || trackingSubscriptions;
+    const delivered = deliverLocationToLocalSubscribers(map, payload, event.orderDisplayId, event.driverId, bus);
+    if (delivered === 0) {
+      bus.recordNoSubscribers();
+    }
+  };
 }
 
-/**
- * Reject a WebSocket connection whose URL carries a `token` query parameter.
- *
- * Tokens must only ever arrive via the first-frame `auth` event; a token in
- * the URL leaks through proxies, CDN/access logs and web analytics. When the
- * client supplies one, the connection is refused with close code 4001 so the
- * leak is impossible rather than merely discouraged (issue #5826).
- *
- * @param {object} ws     The raw WebSocket connection.
- * @param {URL}    reqUrl Parsed request URL.
- * @returns {boolean} true when the connection was rejected (caller should return).
- */
-export function rejectConnectionWithTokenInUrl(ws, reqUrl) {
-  const urlToken = reqUrl.searchParams.get('token');
-  if (!urlToken) return false;
-  logger.warn(
-    { event: 'WS_TOKEN_IN_URL' },
-    'WebSocket auth token present in URL query string; refusing connection',
-  );
-  ws.send(JSON.stringify({
-    error: 'Unauthorized: auth token must not be sent in the URL query string',
-    code: 4001,
-  }));
-  ws.close(4001, 'Auth token must not be sent in the URL query string');
-  return true;
-}
-
-/**
- * Authenticate a WebSocket connection with a bearer token.
- *
- * The token is accepted only via a first-frame `auth` event (issues #5739,
- * #5828); it is never accepted from the connection URL because query-string
- * credentials leak into proxy logs, web analytics and browser history. On
- * success sets `ws.user`, `ws.driverId` and `ws.authenticated = true`, then
- * restores persisted tracking subscriptions. On failure sends an error with
- * code 4001 and closes the socket.
- */
+// =====================================================================
+// AUTHENTICATION & MESSAGING
+// =====================================================================
 async function authenticateWs(ws, token) {
   if (!token) {
     ws.send(JSON.stringify({ error: 'Unauthorized: No token provided', code: 4001 }));
@@ -392,10 +361,7 @@ async function authenticateWs(ws, token) {
       logger.warn({ err: err?.message || err }, '[Tracker] Failed to decode JWT token structure');
     }
 
-    const isSupabaseToken = decoded &&
-      typeof decoded === 'object' &&
-      typeof decoded.iss === 'string' &&
-      (decoded.iss.includes('supabase') || decoded.iss.includes('supabase.co'));
+    const isSupabaseToken = decoded && typeof decoded === 'object' && typeof decoded.iss === 'string' && decoded.iss.includes('supabase');
     let profile = null;
 
     if (isSupabaseToken) {
@@ -406,8 +372,7 @@ async function authenticateWs(ws, token) {
       }
       const response = await supabase.auth.getUser(token);
       const user = response?.data?.user;
-      const authError = response?.error;
-      if (authError || !user) {
+      if (response?.error || !user) {
         ws.send(JSON.stringify({ error: 'Unauthorized: Invalid or expired Supabase token', code: 4001 }));
         ws.close(4001, 'Unauthorized: Invalid or expired Supabase token');
         return;
@@ -427,7 +392,6 @@ async function authenticateWs(ws, token) {
       }
       profile = userProfile;
     } else {
-      // Firebase Verification
       if (!firebaseAdmin) {
         ws.send(JSON.stringify({ error: 'Unauthorized: Firebase Auth is not configured', code: 4001 }));
         ws.close(4001, 'Unauthorized: Firebase Auth is not configured');
@@ -455,15 +419,8 @@ async function authenticateWs(ws, token) {
       profile = userProfile;
     }
 
-    ws.user = {
-      id: profile.id,
-      uid: profile.firebase_uid,
-      role: profile.role,
-    };
-    // Only drivers may publish location telemetry on this socket.
-    if (profile.role === 'driver') {
-      ws.driverId = profile.id;
-    }
+    ws.user = { id: profile.id, uid: profile.firebase_uid, role: profile.role };
+    if (profile.role === 'driver') ws.driverId = profile.id;
     ws.authenticated = true;
     await restoreSubscriptions(ws);
     logger.info({ userId: ws.user.id }, 'WS Authenticated user');
@@ -472,285 +429,6 @@ async function authenticateWs(ws, token) {
     ws.send(JSON.stringify({ error: 'Unauthorized: Invalid token', code: 4001 }));
     ws.close(4001, 'Unauthorized: Invalid token');
   }
-}
-
-/**
- * Build the client-facing `location_update` payload. This is the exact wire
- * format consumed by existing WebSocket clients and is byte-identical whether
- * produced by the publishing replica or reconstructed from a distributed event.
- */
-function buildClientLocationPayload({ driverId, orderDisplayId, lat, lng, speed, bearing, timestampIso }) {
-  return JSON.stringify({
-    event: 'location_update',
-    data: {
-      driver_id: driverId,
-      order_display_id: orderDisplayId,
-      latitude: lat,
-      longitude: lng,
-      speed,
-      bearing,
-      timestamp: timestampIso,
-    },
-  });
-}
-
-/**
- * Rebuild the client-facing payload from a validated internal Pub/Sub event.
- */
-function buildClientPayloadFromInternalEvent(event) {
-  return buildClientLocationPayload({
-    driverId: event.driverId,
-    orderDisplayId: event.orderDisplayId,
-    lat: event.location.lat,
-    lng: event.location.lng,
-    speed: event.location.speed,
-    bearing: event.location.bearing,
-    timestampIso: event.timestamp,
-  });
-}
-
-/**
- * Deliver a location payload to a subscription map's local subscribers.
- *
- * Semantics preserved from the original implementation:
- *   - clients subscribed to the order (`orderDisplayId`) receive it
- *   - clients subscribed to the driver (`driverId`) receive it
- *   - only open sockets (readyState 1) receive it
- *
- * A client subscribed to both the order and the driver receives the payload
- * exactly ONCE (the previous code could send it twice for such a client).
- *
- * @param {Map} subscriptionMap - this replica's local subscription registry.
- * @param {string} payload - serialized client-facing payload.
- * @param {string|null} orderDisplayId - order routing key.
- * @param {string|null} driverId - driver routing key.
- * @param {object} [metricsBus] - location event bus used to record delivery metrics.
- * @returns {number} number of sockets that received the payload.
- */
-function deliverLocationToLocalSubscribers(subscriptionMap, payload, orderDisplayId, driverId, metricsBus) {
-  const bus = metricsBus || locationEventBus;
-  const deliveredSockets = new Set();
-  let delivered = 0;
-
-  if (orderDisplayId && subscriptionMap.has(orderDisplayId)) {
-    for (const client of subscriptionMap.get(orderDisplayId)) {
-      if (client.readyState === 1 && !deliveredSockets.has(client)) {
-        deliveredSockets.add(client);
-        client.send(payload);
-        delivered++;
-      }
-    }
-  }
-
-  if (driverId && subscriptionMap.has(driverId)) {
-    for (const client of subscriptionMap.get(driverId)) {
-      if (client.readyState === 1 && !deliveredSockets.has(client)) {
-        deliveredSockets.add(client);
-        client.send(payload);
-        delivered++;
-      }
-    }
-  }
-
-  bus?.recordDelivery(delivered);
-  return delivered;
-}
-
-/**
- * Build the handler invoked for every VALID distributed location event received
- * on a replica. The publishing replica already delivered the event locally, so
- * its own events (matching sourceInstanceId) are skipped — this is what
- * prevents duplicate delivery to local clients.
- *
- * @param {object} [targetBus] - bus instance that received the event
- *   (defaults to the module-level bus; required for multi-instance tests).
- * @param {Map} [subscriptionMap] - local subscription registry to deliver to
- *   (defaults to the module-level registry).
- */
-function createLocationEventHandler(targetBus, subscriptionMap) {
-  return (event) => {
-    const bus = targetBus || locationEventBus;
-    if (!bus) return;
-    if (event.sourceInstanceId === bus.getInstanceId()) return;
-
-    const payload = buildClientPayloadFromInternalEvent(event);
-    const map = subscriptionMap || trackingSubscriptions;
-    const delivered = deliverLocationToLocalSubscribers(map, payload, event.orderDisplayId, event.driverId, bus);
-    if (delivered === 0) {
-      bus.recordNoSubscribers();
-    }
-  };
-}
-
-/**
- * Initialize WebSockets Server and bind event handlers
- */
-export function initWebSocketServer(server, orderRepository) {
-  if (wsServer) {
-    logger.warn('[initWebSocketServer] Already initialized — skipping duplicate call to prevent connection leaks.');
-    return;
-  }
-
-  _orderRepository = orderRepository;
-  _deliveryDelayService = orderRepository ? new DeliveryDelayService({ orderRepository }) : null;
-  const MAX_WS_PAYLOAD_BYTES = parseInt(process.env.WS_MAX_PAYLOAD_BYTES, 10) || 4096;
-  const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_PAYLOAD_BYTES });
-  wsServer = wss;
-
-  // Start the distributed location fan-out. When Redis is unavailable this
-  // degrades to local-only delivery; the WebSocket server keeps working.
-  if (!locationEventBus) {
-    locationEventBus = createLocationEventBus();
-    locationEventBus.init(redisClient);
-    locationEventBus.subscribe(createLocationEventHandler());
-  }
-
-  server.on('upgrade', async (request, socket, head) => {
-    const pathname = new URL(request.url, 'http://localhost').pathname;
-
-    if (pathname === '/ws/tracking') {
-      const allowed = await isWebSocketUpgradeAllowed(request);
-
-      if (!allowed) {
-        rejectWebSocketUpgrade(socket);
-        return;
-      }
-
-      wss.handleUpgrade(request, socket, head, (ws) => {
-        wss.emit('connection', ws, request);
-      });
-    } else {
-      socket.destroy();
-    }
-  });
-
-  wss.on('connection', async (ws, req) => {
-    ws._request = req;
-    ws.socketId = ws.socketId || crypto.randomUUID();
-    const reqUrl = new URL(req.url, 'http://localhost');
-    const bypassAuth = process.env.BYPASS_AUTH === 'true';
-
-    // Register event handlers up front so a first-frame `auth` message can be
-    // processed when no token is present in the URL (issue #5739).
-    ws.isAlive = true;
-
-    ws.on('pong', () => {
-      ws.isAlive = true;
-    });
-
-    ws.on('message', (message) => {
-      handleTrackingMessage(ws, message, req);
-    });
-
-    ws.on('close', () => {
-      logger.info('WebSocket connection closed');
-      ws.pendingAuthQueue = [];
-      ws.isAuthenticating = false;
-      void (async () => {
-        await removeClientFromAllSubscriptions(ws);
-        if (ws.driverId) await removeDriverLocationChannels(ws.driverId);
-      })();
-    });
-
-    ws.on('error', (err) => {
-      logger.error({ err }, 'WebSocket client error');
-      void (async () => {
-        await removeClientFromAllSubscriptions(ws);
-        if (ws.driverId) await removeDriverLocationChannels(ws.driverId);
-      })();
-    });
-
-    // A bearer token in the URL query string is a client bug and a credential
-    // leak (issue #5826): it would be written to proxies, CDN/access logs and
-    // web analytics. Refuse the connection loudly instead of silently ignoring
-    // the credential so a future client change cannot reintroduce the leak.
-    if (rejectConnectionWithTokenInUrl(ws, reqUrl)) {
-      return;
-    }
-
-    if (bypassAuth) {
-      if (process.env.NODE_ENV === 'production') {
-        ws.send(JSON.stringify({ error: 'BYPASS_AUTH is not allowed in production', code: 4003 }));
-        ws.close(4003, 'BYPASS_AUTH is not allowed in production');
-        return;
-      }
-      const devToken = reqUrl.searchParams.get('dev_access_token');
-      if (!devToken || !process.env.DEV_ACCESS_TOKEN || devToken !== process.env.DEV_ACCESS_TOKEN) {
-        ws.send(JSON.stringify({ error: 'Unauthorized: Missing or invalid dev_access_token', code: 4001 }));
-        ws.close(4001, 'Unauthorized: Missing or invalid dev_access_token');
-        return;
-      }
-      ws.driverId = reqUrl.searchParams.get('driver_id') || 'test_driver';
-      ws.user = {
-        id: reqUrl.searchParams.get('user_id') || ws.driverId,
-        role: reqUrl.searchParams.get('user_role') || 'driver',
-      };
-      ws.authenticated = true;
-      logger.warn({ event: 'WS_BYPASS_AUTH_USED', driverId: ws.driverId, role: ws.user.role }, 'WS Auth bypassed via DEV_ACCESS_TOKEN');
-      logger.info('New WebSocket connection established on /ws/tracking');
-      return;
-    }
-
-    // Tokens are never accepted from the URL query string (issue #5828).
-    // Authentication is deferred until the client sends a first-frame `auth`
-    // event so credentials never leak via query strings into proxies, logs or
-    // web analytics (issue #5739).
-    ws.authenticated = false;
-    ws.isAuthenticating = false;
-    ws.pendingAuthQueue = [];
-    const authTimeout = setTimeout(() => {
-      if (ws.authenticated === false) {
-        ws.send(JSON.stringify({ error: 'Unauthorized: Authentication timeout', code: 4001 }));
-        ws.close(4001, 'Unauthorized: Authentication timeout');
-      }
-    }, WS_AUTH_TIMEOUT_MS);
-    ws.once('close', () => clearTimeout(authTimeout));
-    logger.info('New WebSocket connection established on /ws/tracking (awaiting first-frame auth)');
-  });
-
-  wsHeartbeatInterval = setInterval(() => {
-    wss.clients.forEach((ws) => {
-      if (ws.isAlive === false) {
-        logger.info('Terminating unresponsive WebSocket client');
-        return ws.terminate();
-      }
-      ws.isAlive = false;
-      ws.ping();
-    });
-  }, HEARTBEAT_INTERVAL_MS);
-
-  wss.on('close', () => {
-    if (wsHeartbeatInterval) {
-      clearInterval(wsHeartbeatInterval);
-      wsHeartbeatInterval = null;
-    }
-    if (messageRateTrackerCleanupInterval) {
-      clearInterval(messageRateTrackerCleanupInterval);
-      messageRateTrackerCleanupInterval = null;
-    }
-  });
-
-  messageRateTrackerCleanupInterval = setInterval(() => {
-    sweepMessageRateTracker();
-  }, 30000);
-
-  // Periodically purge expired per-IP WebSocket upgrade-limit entries, so the
-  // in-memory fallback map does not leak during Redis outages.
-  wsUpgradeLimitsCleanupInterval = setInterval(() => {
-    sweepWsUpgradeMemoryLimits();
-  }, WS_UPGRADE_LIMITS_SWEEP_INTERVAL_MS);
-
-  // Periodically purge stale circuit-breaker state for drivers, regardless of
-  // the total number of active drivers (fixes unbounded growth under < 50 drivers).
-  driverStateSweepInterval = setInterval(() => {
-    sweepStaleDriverState(Date.now());
-  }, DRIVER_STATE_SWEEP_INTERVAL_MS);
-
-  if (!isSchedulerActive) {
-    telemetryBuffer.start();
-  }
-
-  logger.info('🚀 WebSocket tracking router initialized.');
 }
 
 function isMessageRateLimitedInMemory(ws) {
@@ -765,10 +443,6 @@ function isMessageRateLimitedInMemory(ws) {
   return state.count > MAX_MSG_PER_SECOND;
 }
 
-const MESSAGE_RATE_TRACKER_SWEEP_INTERVAL_MS = 30000;
-
-// Periodically drop rate-limit state for sockets whose window has long since
-// expired, bounding the in-memory map now that it is a regular Map.
 function sweepMessageRateTracker() {
   const now = Date.now();
   for (const [id, state] of messageRateTracker) {
@@ -778,27 +452,16 @@ function sweepMessageRateTracker() {
   }
 }
 
-/**
- * Per-socket message rate limiter (issue #986). Counts messages in a Redis
- * keyed by socket + 1-second window so the cap holds cluster-wide across all
- * API instances, and falls back to the in-memory limiter when Redis is down
- * so the cap is still enforced on this node.
- */
 export async function isMessageRateLimited(ws) {
   if (redisClient && redisClient.status === 'ready') {
     try {
       const bucket = Math.floor(Date.now() / 1000);
       const key = `ws:msg:${ws.socketId || ws.driverId || 'anon'}:${bucket}`;
       const count = await redisClient.incr(key);
-      if (count === 1) {
-        await redisClient.expire(key, 2);
-      }
+      if (count === 1) await redisClient.expire(key, 2);
       return count > MAX_MSG_PER_SECOND;
     } catch (err) {
-      logger.warn(
-        'Redis WS message rate limit failed, falling back to in-memory:',
-        err.message,
-      );
+      logger.warn('Redis WS message rate limit failed, falling back to in-memory:', err.message);
     }
   }
   return isMessageRateLimitedInMemory(ws);
@@ -806,12 +469,10 @@ export async function isMessageRateLimited(ws) {
 
 export async function handleTrackingMessage(ws, message, req) {
   if (await isMessageRateLimited(ws)) {
-    ws.send(JSON.stringify({ error: 'Rate limit exceeded: too many messages per second', code: 429, retryAfter: 1 }));
-    return;
+    return ws.send(JSON.stringify({ error: 'Rate limit exceeded: too many messages per second', code: 429, retryAfter: 1 }));
   }
 
   const messageText = message.toString();
-
   if (messageText === 'ping') {
     ws.isAlive = true;
     return ws.send('pong');
@@ -826,9 +487,7 @@ export async function handleTrackingMessage(ws, message, req) {
     }
 
     if (ws.isAuthenticating) {
-      if (!ws.pendingAuthQueue) {
-        ws.pendingAuthQueue = [];
-      }
+      ws.pendingAuthQueue ??= [];
       if (ws.pendingAuthQueue.length < 50) {
         ws.pendingAuthQueue.push({ message, req });
       } else {
@@ -838,19 +497,13 @@ export async function handleTrackingMessage(ws, message, req) {
       return;
     }
 
-    // First-frame auth handshake (issue #5739): a client that connected
-    // without a `token` query parameter must present a bearer token in an
-    // `auth` event before any other message is accepted.
     if (ws.authenticated === false) {
       if (event === 'auth') {
         ws.isAuthenticating = true;
         try {
           await authenticateWs(ws, data.token);
           if (ws.authenticated) {
-            ws.send(JSON.stringify({
-              status: 'authenticated',
-              user_id: ws.user?.id ?? ws.driverId,
-            }));
+            ws.send(JSON.stringify({ status: 'authenticated', user_id: ws.user?.id ?? ws.driverId }));
             logger.info('New WebSocket connection established on /ws/tracking (first-frame auth)');
 
             const queue = ws.pendingAuthQueue || [];
@@ -882,15 +535,12 @@ export async function handleTrackingMessage(ws, message, req) {
       case 'location_ping':
         await handleLocationPing(ws, data, req);
         break;
-
       case 'subscribe_tracking':
         await handleSubscribe(ws, data);
         break;
-
       case 'unsubscribe_tracking':
         await handleUnsubscribe(ws, data);
         break;
-
       default:
         ws.send(JSON.stringify({ warning: `Unknown event type: ${event}` }));
     }
@@ -900,40 +550,9 @@ export async function handleTrackingMessage(ws, message, req) {
   }
 }
 
-/**
- * Persist a GPS log document to MongoDB with bounded exponential backoff.
- *
- * Retries `GpsLog.create` up to 3 times (delays 100ms, 200ms, 400ms). On
- * permanent failure the document is routed to the Redis dead-letter queue so
- * it can be replayed later instead of being silently lost (issue #11373).
- *
- * @param {object} doc - the GpsLog document to persist.
- * @returns {Promise<boolean>} true when the document was persisted or DLQ-enqueued.
- */
-async function persistGpsLogWithRetry(doc) {
-  for (let attempt = 0; attempt < GPS_LOG_RETRY_DELAYS_MS.length; attempt++) {
-    try {
-      await GpsLog.create(doc);
-      return true;
-    } catch (err) {
-      logger.warn(
-        { err, attempt: attempt + 1 },
-        `[GpsLog] Write attempt ${attempt + 1} failed; backing off ${GPS_LOG_RETRY_DELAYS_MS[attempt]}ms`,
-      );
-      await new Promise((resolve) => setTimeout(resolve, GPS_LOG_RETRY_DELAYS_MS[attempt]));
-    }
-  }
-
-  logger.error('[GpsLog] All write attempts failed; routing document to dead-letter queue');
-  await enqueueGpsLogDlq(doc);
-  return false;
-}
-
-/**
- * Push a permanently-failed GPS log document onto the Redis dead-letter list.
- * If Redis is unavailable (or the push fails) the document is logged as
- * permanently lost because there is no store in which to retain it.
- */
+// =====================================================================
+// DLQ & GPS LOG RETRY LOGIC
+// =====================================================================
 async function enqueueGpsLogDlq(doc) {
   if (redisClient && redisClient.status === 'ready') {
     try {
@@ -943,14 +562,24 @@ async function enqueueGpsLogDlq(doc) {
       logger.error({ err }, '[GpsLog] Failed to enqueue GPS log to Redis DLQ');
     }
   }
-  logger.error('[GpsLog] Redis unavailable — GPS log permanently lost (could not enqueue to DLQ):', JSON.stringify(doc));
+  logger.error('[GpsLog] Redis unavailable — GPS log permanently lost:', JSON.stringify(doc));
 }
 
-/**
- * Re-attempt a single DLQ entry. Returns true when the entry should be removed
- * from the DLQ (successfully written, malformed, or exhausted retries) and
- * false when it must stay (Redis unavailable at replay time / re-enqueue failed).
- */
+async function persistGpsLogWithRetry(doc) {
+  for (let attempt = 0; attempt < GPS_LOG_RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      await GpsLog.create(doc);
+      return true;
+    } catch (err) {
+      logger.warn({ err, attempt: attempt + 1 }, `[GpsLog] Write attempt ${attempt + 1} failed`);
+      await new Promise((resolve) => setTimeout(resolve, GPS_LOG_RETRY_DELAYS_MS[attempt]));
+    }
+  }
+  logger.error('[GpsLog] All write attempts failed; routing document to dead-letter queue');
+  await enqueueGpsLogDlq(doc);
+  return false;
+}
+
 async function reconcileGpsLogDlqEntry(raw) {
   let entry;
   try {
@@ -967,13 +596,11 @@ async function reconcileGpsLogDlqEntry(raw) {
     return true;
   } catch (err) {
     logger.warn({ err }, '[GpsLog] DLQ re-attempt failed');
-
     if (retries >= GPS_LOG_MAX_RETRIES) {
       logger.error('[GpsLog] DLQ entry exceeded max retries; dropping permanently:', JSON.stringify(doc));
       return true;
     }
 
-    // Re-enqueue with an incremented retry counter for the next reconcile pass.
     if (redisClient && redisClient.status === 'ready') {
       try {
         await redisClient.rpush(GPS_LOG_DLQ_KEY, JSON.stringify({ doc, retries: retries + 1 }));
@@ -983,17 +610,10 @@ async function reconcileGpsLogDlqEntry(raw) {
         return false;
       }
     }
-
-    // Redis unavailable — leave the entry in place for a later reconcile.
     return false;
   }
 }
 
-/**
- * Drain the GPS log dead-letter list, re-attempting each write. Entries that
- * fail to replay are re-enqueued (up to GPS_LOG_MAX_RETRIES times) or left in
- * the list when Redis is unavailable.
- */
 async function reconcileGpsLogDlq() {
   if (!redisClient || redisClient.status !== 'ready') return;
   try {
@@ -1002,7 +622,6 @@ async function reconcileGpsLogDlq() {
       if (!raw) break;
       const shouldRemove = await reconcileGpsLogDlqEntry(raw);
       if (!shouldRemove) {
-        // Could not process now (e.g. Redis down) — put it back and stop.
         await redisClient.rpush(GPS_LOG_DLQ_KEY, raw);
         break;
       }
@@ -1012,14 +631,14 @@ async function reconcileGpsLogDlq() {
   }
 }
 
+// =====================================================================
+// LOCATION PING PROCESSING
+// =====================================================================
 export async function handleLocationPing(ws, data, req) {
   const driver_id = ws.driverId;
 
   if (!driver_id || ws.user?.role !== 'driver') {
-    return ws.send(JSON.stringify({
-      error: 'Forbidden: Driver role required to publish location updates',
-      code: 4003,
-    }));
+    return ws.send(JSON.stringify({ error: 'Forbidden: Driver role required to publish location updates', code: 4003 }));
   }
 
   const { driver_id: payloadDriverId, speed, bearing, device_timestamp } = data;
@@ -1041,40 +660,20 @@ export async function handleLocationPing(ws, data, req) {
     return;
   }
 
-  // Also validate if payload provides driver_id that it must not be different
   if (!payloadDriverId) {
-    // If not provided, add the authenticated driver_id to data
     data.driver_id = driver_id;
   }
 
   const lat = data.lat !== undefined ? data.lat : data.latitude;
   const lng = data.lng !== undefined ? data.lng : data.longitude;
 
-  // Cross-field validation: require at least one complete coordinate pair.
-  const hasLatLng = data.lat !== undefined && data.lng !== undefined;
-  const hasLatLong = data.latitude !== undefined && data.longitude !== undefined;
-  if (!hasLatLng && !hasLatLong) {
-    return ws.send(JSON.stringify({
-      error: 'Invalid telemetry payload',
-      details: ['At least one coordinate pair (lat+lng or latitude+longitude) is required.']
-    }));
-  }
-
-  // Reject frames with null or undefined resolved coordinates before schema validation
   if (lat === null || lat === undefined || lng === null || lng === undefined) {
     return ws.send(JSON.stringify({ error: 'Invalid telemetry payload.', details: ['lat and lng are required'] }));
   }
 
-  // Canonicalise `latitude`/`longitude` into `lat`/`lng` so the schema
-  // validation, sanitisation and the buffered telemetry record all operate on
-  // one canonical coordinate pair regardless of which naming the client used.
-  // Normalize the alternate latitude/longitude names into the canonical
-  // lat/lng keys so schema validation, sanitization and persistence
-  // downstream all operate on the resolved coordinates.
   data.lat = lat;
   data.lng = lng;
 
-  // Fix 3 + dead-code fix: run the payload through the schema validator/
   const normalizedForValidation = {
     lat,
     lng,
@@ -1092,7 +691,6 @@ export async function handleLocationPing(ws, data, req) {
   const sanitized = sanitizeTelemetryData(data);
   Object.assign(data, sanitized);
 
-  // Parse device timestamp for analytics and clock skew check only (Fix 1)
   let deviceTime = null;
   if (device_timestamp) {
     const parsedEpoch = Date.parse(device_timestamp);
@@ -1103,71 +701,46 @@ export async function handleLocationPing(ws, data, req) {
     }
   }
 
-  // Clock skew validation — compare device time against server time with a configurable tolerance
   const skewCheckTime = deviceTime || new Date();
   const skewMs = Math.abs(skewCheckTime.getTime() - Date.now());
   if (skewMs > CLOCK_SKEW_TOLERANCE_MS) {
-    logger.warn(
-      `[TRUXIFY CLOCK SKEW] Driver ${driver_id} clock skew ${skewMs}ms exceeds tolerance ` +
-      `${CLOCK_SKEW_TOLERANCE_MS}ms — ignoring update.`
-    );
+    logger.warn(`[TRUXIFY CLOCK SKEW] Driver ${driver_id} clock skew ${skewMs}ms exceeds tolerance ${CLOCK_SKEW_TOLERANCE_MS}ms — ignoring update.`);
     return;
   }
 
-  // Fix 1: Server receive time, used as the monotonic order key fallback
-  // when the device does not supply a device_timestamp (issue #11671).
   const serverNow = Date.now();
 
-  // Fix 4: IDEMPOTENCY GATE & OUT-OF-ORDER SEQUENCER + Circuit breaker
   if (redisClient) {
     try {
       const seqKey = `driver:sequence:${driver_id}`;
       const lastRecordedEpochStr = await redisClient.get(seqKey);
       const lastRecordedEpoch = Number.parseInt(lastRecordedEpochStr, 10);
-
-      // Strictly-increasing gate: compare with `<` (not `<=`) and use the
-      // device-supplied timestamp when available so two legitimate updates
-      // that share a server-side millisecond are never dropped as "out of
-      // order" (issue #11671). Genuinely stale updates whose order key has
-      // already advanced past the current receive time are still discarded.
       const orderKey = deviceTime ? deviceTime.getTime() : serverNow;
+
       if (!Number.isNaN(lastRecordedEpoch) && orderKey < lastRecordedEpoch) {
         logger.warn(`[TRUXIFY SEQUENCE CONTROL] Out-of-order telemetry dropped for Driver: ${driver_id}. Stale jitter detected.`);
 
-        // Circuit breaker: if too many consecutive drops, reset the sequence
         const prevEntry = consecutiveDropCount.get(driver_id);
         const currentCount = (prevEntry ? prevEntry.count : 0) + 1;
         consecutiveDropCount.set(driver_id, { count: currentCount, lastUpdated: serverNow });
         sweepStaleDriverState(serverNow);
+
         if (currentCount >= MAX_CONSECUTIVE_DROPS) {
-          logger.warn(
-            `[TRUXIFY CIRCUIT BREAKER] Driver ${driver_id} exceeded max consecutive drops ` +
-            `(${MAX_CONSECUTIVE_DROPS}). Resetting sequence.`
-          );
+          logger.warn(`[TRUXIFY CIRCUIT BREAKER] Driver ${driver_id} exceeded max consecutive drops (${MAX_CONSECUTIVE_DROPS}). Resetting sequence.`);
           await redisClient.del(seqKey);
           consecutiveDropCount.delete(driver_id);
         }
         return;
       }
 
-      // Reset circuit breaker on successful sequence advancement
       consecutiveDropCount.delete(driver_id);
-
-      // Advance a strictly-increasing monotonic counter: when the update
-      // shares a timestamp with the previous accepted one, bump the stored
-      // sequence by 1 instead of rewriting the same value so the gate keeps
-      // moving forward.
-      const nextSequence =
-        Number.isNaN(lastRecordedEpoch) || orderKey > lastRecordedEpoch
-          ? orderKey
-          : lastRecordedEpoch + 1;
+      const nextSequence = Number.isNaN(lastRecordedEpoch) || orderKey > lastRecordedEpoch ? orderKey : lastRecordedEpoch + 1;
       await redisClient.set(seqKey, nextSequence.toString(), 'EX', 86400);
     } catch (err) {
       logger.error({ err }, 'Redis sequence verification cache error');
     }
   }
 
-  // Resolve order details from Supabase and verify driver ownership with fail-closed security (#14789)
   let orderUUID = data.orderId || data.order_id || null;
   let orderDisplayId = data.order_display_id || null;
 
@@ -1189,14 +762,12 @@ export async function handleLocationPing(ws, data, req) {
         verifiedOrder = foundOrder;
       }
 
-      // Fail-closed: If an order ID was supplied but could not be resolved, reject telemetry broadcast
       if (!verifiedOrder) {
         logger.warn({ event: 'UNRESOLVABLE_ORDER_TRACKING', driver_id, idToLookup }, 'Location ping rejected: unable to resolve order');
         await invalidateDriverOrderCache(driver_id);
         return ws.send(JSON.stringify({ error: 'Order not found or unresolvable', orderId: idToLookup }));
       }
 
-      // Strict ownership check: driver_id must match
       if (verifiedOrder.driver_id !== driver_id) {
         logger.warn({
           event: 'UNAUTHORIZED_ORDER_TRACKING',
@@ -1220,9 +791,6 @@ export async function handleLocationPing(ws, data, req) {
     }
   }
 
-  // Recalculate ETA only after the authenticated driver/order ownership check
-  // above has succeeded. This is best-effort and never blocks telemetry or
-  // location broadcasts.
   if (_deliveryDelayService && orderUUID) {
     void _deliveryDelayService.processLocation({
       orderId: orderUUID,
@@ -1234,18 +802,13 @@ export async function handleLocationPing(ws, data, req) {
     });
   }
 
-  // Buffer write with capacity limit. Synchronous, non-blocking enqueue into
-  // the shared telemetry pipeline — the broadcast path never waits on MongoDB.
   telemetryBuffer.enqueue({
     driver_id,
     order_id: orderUUID || null,
     order_display_id: orderDisplayId || null,
     lat: sanitized.lat,
     lng: sanitized.lng,
-    location: {
-      type: 'Point',
-      coordinates: [sanitized.lng, sanitized.lat]
-    },
+    location: { type: 'Point', coordinates: [sanitized.lng, sanitized.lat] },
     speed_kmh: sanitized.speed ?? 0,
     bearing_deg: sanitized.bearing ?? 0,
     timestamp: deviceTime || new Date(),
@@ -1256,9 +819,8 @@ export async function handleLocationPing(ws, data, req) {
 
   if (redisClient) {
     try {
-      const redisKey = `driver:location:${driver_id}`;
       await redisClient.set(
-        redisKey,
+        `driver:location:${driver_id}`,
         JSON.stringify({ latitude: sanitized.lat, longitude: sanitized.lng, speed: sanitized.speed ?? 0, bearing: sanitized.bearing ?? 0, updated_at: new Date(serverNow) }),
         'EX',
         120
@@ -1268,41 +830,20 @@ export async function handleLocationPing(ws, data, req) {
     }
   }
 
-  // Upsert the driver's live location into `driver_locations` (fire-and-forget
-  // so the WebSocket broadcast path is never blocked). This is the only writer
-  // for the table that feeds new-trip nearby-driver notifications and public
-  // shared tracking. The service-role client is required — RLS grants anon
-  // nothing on `driver_locations`, so an anon write would always be rejected.
-  // Deactivating any prior active row keeps exactly one live row per driver,
-  // matching the `drivers` view's `sync_drivers_update()` trigger (issue #8932).
   if (supabaseAdmin) {
     void (async () => {
       try {
-        await supabaseAdmin
-          .from('driver_locations')
-          .update({ is_active: false })
-          .eq('driver_id', driver_id)
-          .eq('is_active', true);
-        const { error } = await supabaseAdmin
-          .from('driver_locations')
-          .insert({
-            driver_id,
-            latitude: lat,
-            longitude: lng,
-            is_active: true,
-            last_updated_at: new Date(serverNow).toISOString(),
-          });
-        if (error) {
-          logger.error(
-            { error, driver_id },
-            '[Tracker] Failed to write driver location',
-          );
-        }
+        await supabaseAdmin.from('driver_locations').update({ is_active: false }).eq('driver_id', driver_id).eq('is_active', true);
+        const { error } = await supabaseAdmin.from('driver_locations').insert({
+          driver_id,
+          latitude: lat,
+          longitude: lng,
+          is_active: true,
+          last_updated_at: new Date(serverNow).toISOString(),
+        });
+        if (error) logger.error({ error, driver_id }, '[Tracker] Failed to write driver location');
       } catch (err) {
-        logger.error(
-          { err, driver_id },
-          '[Tracker] Failed to write driver location',
-        );
+        logger.error({ err, driver_id }, '[Tracker] Failed to write driver location');
       }
     })();
   }
@@ -1318,10 +859,6 @@ export async function handleLocationPing(ws, data, req) {
     timestampIso,
   });
 
-  // ── Distributed fan-out (multi-replica) ──────────────────────────────
-  // Publish a compact internal event to the shared Redis channel so every API
-  // replica can deliver this update to its own local subscribers. Best-effort
-  // and fire-and-forget — local delivery below never depends on Redis.
   if (locationEventBus) {
     void locationEventBus.publish({
       type: 'location_update',
@@ -1331,18 +868,10 @@ export async function handleLocationPing(ws, data, req) {
       orderDisplayId: orderDisplayId ?? null,
       sequence: serverNow,
       timestamp: timestampIso,
-      location: {
-        lat: sanitized.lat,
-        lng: sanitized.lng,
-        speed: sanitized.speed ?? 0,
-        bearing: sanitized.bearing ?? 0,
-      },
+      location: { lat: sanitized.lat, lng: sanitized.lng, speed: sanitized.speed ?? 0, bearing: sanitized.bearing ?? 0 },
     });
   }
 
-  // Local delivery to this replica's own order/driver subscribers. The
-  // publishing replica's Pub/Sub consumer skips self-originated events, so a
-  // client on this replica receives the update exactly once.
   deliverLocationToLocalSubscribers(trackingSubscriptions, broadcastPayload, orderDisplayId ?? null, driver_id);
 
   if (_orderRepository && orderUUID) {
@@ -1356,127 +885,203 @@ export async function handleLocationPing(ws, data, req) {
     });
   }
 
-  // Publish to Supabase Realtime channel driver-location:{orderId}
-  // Reuse cached channel to avoid creating a new channel per ping.
   if (supabase && orderUUID) {
-    if (!locationChannels.has(orderUUID)) {
-      const channel = supabase.channel(`driver-location:${orderUUID}`);
-      channel.subscribe();
-      locationChannels.set(orderUUID, channel);
-      if (driver_id) {
-        if (!driverToLocationChannels.has(driver_id)) {
-          driverToLocationChannels.set(driver_id, new Set());
+    let reconnectAttempts = 0;
+    const connectChannel = () => {
+      if (!locationChannels.has(orderUUID)) {
+        const channel = supabase.channel(`driver-location:${orderUUID}`);
+        channel.subscribe((status, err) => {
+          if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+            reconnectAttempts++;
+            const backoffMs = reconnectAttempts * 1000;
+            logger.warn({ orderUUID, reconnectAttempts, backoffMs }, 'Supabase Realtime channel error. Retrying connection with exponential backoff.');
+            locationChannels.delete(orderUUID);
+            setTimeout(connectChannel, backoffMs);
+          } else if (status === 'SUBSCRIBED') {
+            reconnectAttempts = 0;
+          }
+        });
+        locationChannels.set(orderUUID, channel);
+
+        if (driver_id) {
+          if (!driverToLocationChannels.has(driver_id)) driverToLocationChannels.set(driver_id, new Set());
+          driverToLocationChannels.get(driver_id).add(orderUUID);
         }
-        driverToLocationChannels.get(driver_id).add(orderUUID);
-      }
-      if (orderDisplayId) {
-        if (!displayIdToLocationChannelKeys.has(orderDisplayId)) {
-          displayIdToLocationChannelKeys.set(orderDisplayId, new Set());
+        if (orderDisplayId) {
+          if (!displayIdToLocationChannelKeys.has(orderDisplayId)) displayIdToLocationChannelKeys.set(orderDisplayId, new Set());
+          displayIdToLocationChannelKeys.get(orderDisplayId).add(orderUUID);
         }
-        displayIdToLocationChannelKeys.get(orderDisplayId).add(orderUUID);
       }
-    }
+    };
+
+    connectChannel();
     const channel = locationChannels.get(orderUUID);
     channel.send({
       type: 'broadcast',
       event: 'location',
-      payload: {
-        orderId: orderUUID,
-        driverId: driver_id,
-        lat: sanitized.lat,
-        lng: sanitized.lng,
-        timestamp: new Date(serverNow).toISOString()
-      }
+      payload: { orderId: orderUUID, driverId: driver_id, lat: sanitized.lat, lng: sanitized.lng, timestamp: new Date(serverNow).toISOString() }
     }).catch((err) => {
       logger.error({ err }, 'Failed to broadcast realtime location to Supabase');
     });
   }
 }
 
+// =====================================================================
+// SERVER INITIALIZATION & TEARDOWN
+// =====================================================================
+export function initWebSocketServer(server, orderRepository) {
+  if (wsServer) {
+    logger.warn('[initWebSocketServer] Already initialized — skipping duplicate call.');
+    return;
+  }
+
+  _orderRepository = orderRepository;
+  _deliveryDelayService = orderRepository ? new DeliveryDelayService({ orderRepository }) : null;
+  const wss = new WebSocketServer({ noServer: true, maxPayload: WS_MAX_PAYLOAD_BYTES });
+  wsServer = wss;
+
+  if (!locationEventBus) {
+    locationEventBus = createLocationEventBus();
+    locationEventBus.init(redisClient);
+    locationEventBus.subscribe(createLocationEventHandler());
+  }
+
+  server.on('upgrade', async (request, socket, head) => {
+    const pathname = new URL(request.url, 'http://localhost').pathname;
+    if (pathname === '/ws/tracking') {
+      if (!(await isWebSocketUpgradeAllowed(request))) {
+        rejectWebSocketUpgrade(socket);
+        return;
+      }
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request);
+      });
+    } else {
+      socket.destroy();
+    }
+  });
+
+  wss.on('connection', async (ws, req) => {
+    ws._request = req;
+    ws.socketId = ws.socketId || crypto.randomUUID();
+    const reqUrl = new URL(req.url, 'http://localhost');
+    const bypassAuth = process.env.BYPASS_AUTH === 'true';
+
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
+    ws.on('message', (message) => handleTrackingMessage(ws, message, req));
+    ws.on('close', () => {
+      logger.info('WebSocket connection closed');
+      ws.pendingAuthQueue = [];
+      ws.isAuthenticating = false;
+      void (async () => {
+        await removeClientFromAllSubscriptions(ws);
+        if (ws.driverId) await removeDriverLocationChannels(ws.driverId);
+      })();
+    });
+
+    ws.on('error', (err) => {
+      logger.error({ err }, 'WebSocket client error');
+      void (async () => {
+        await removeClientFromAllSubscriptions(ws);
+        if (ws.driverId) await removeDriverLocationChannels(ws.driverId);
+      })();
+    });
+
+    if (rejectConnectionWithTokenInUrl(ws, reqUrl)) return;
+
+    if (bypassAuth) {
+      if (process.env.NODE_ENV === 'production') {
+        ws.send(JSON.stringify({ error: 'BYPASS_AUTH is not allowed in production', code: 4003 }));
+        return ws.close(4003, 'BYPASS_AUTH is not allowed in production');
+      }
+      const devToken = reqUrl.searchParams.get('dev_access_token');
+      if (!devToken || devToken !== process.env.DEV_ACCESS_TOKEN) {
+        ws.send(JSON.stringify({ error: 'Unauthorized: Missing or invalid dev_access_token', code: 4001 }));
+        return ws.close(4001, 'Unauthorized: Missing or invalid dev_access_token');
+      }
+      ws.driverId = reqUrl.searchParams.get('driver_id') || 'test_driver';
+      ws.user = { id: reqUrl.searchParams.get('user_id') || ws.driverId, role: reqUrl.searchParams.get('user_role') || 'driver' };
+      ws.authenticated = true;
+      logger.warn({ event: 'WS_BYPASS_AUTH_USED', driverId: ws.driverId, role: ws.user.role }, 'WS Auth bypassed via DEV_ACCESS_TOKEN');
+      return;
+    }
+
+    ws.authenticated = false;
+    ws.isAuthenticating = false;
+    ws.pendingAuthQueue = [];
+    const authTimeout = setTimeout(() => {
+      if (ws.authenticated === false) {
+        ws.send(JSON.stringify({ error: 'Unauthorized: Authentication timeout', code: 4001 }));
+        ws.close(4001, 'Unauthorized: Authentication timeout');
+      }
+    }, WS_AUTH_TIMEOUT_MS);
+    ws.once('close', () => clearTimeout(authTimeout));
+  });
+
+  wsHeartbeatInterval = setInterval(() => {
+    wss.clients.forEach((ws) => {
+      if (ws.isAlive === false) return ws.terminate();
+      ws.isAlive = false;
+      ws.ping();
+    });
+  }, HEARTBEAT_INTERVAL_MS);
+
+  wss.on('close', () => {
+    if (wsHeartbeatInterval) { clearInterval(wsHeartbeatInterval); wsHeartbeatInterval = null; }
+    if (messageRateTrackerCleanupInterval) { clearInterval(messageRateTrackerCleanupInterval); messageRateTrackerCleanupInterval = null; }
+  });
+
+  messageRateTrackerCleanupInterval = setInterval(sweepMessageRateTracker, 30000);
+  wsUpgradeLimitsCleanupInterval = setInterval(sweepWsUpgradeMemoryLimits, WS_UPGRADE_LIMITS_SWEEP_INTERVAL_MS);
+  driverStateSweepInterval = setInterval(() => sweepStaleDriverState(Date.now()), DRIVER_STATE_SWEEP_INTERVAL_MS);
+
+  if (!isSchedulerActive) telemetryBuffer.start();
+  logger.info('🚀 WebSocket tracking router initialized.');
+}
 
 export async function closeWebSocketServer() {
-  if (telemetryFlushTimeout) {
-    clearTimeout(telemetryFlushTimeout);
-    telemetryFlushTimeout = null;
-    isSchedulerActive = false;
-  }
+  if (telemetryFlushTimeout) { clearTimeout(telemetryFlushTimeout); telemetryFlushTimeout = null; isSchedulerActive = false; }
+  if (telemetryMonitorInterval) { clearInterval(telemetryMonitorInterval); telemetryMonitorInterval = null; }
+  if (wsHeartbeatInterval) { clearInterval(wsHeartbeatInterval); wsHeartbeatInterval = null; }
 
-  if (telemetryMonitorInterval) {
-    clearInterval(telemetryMonitorInterval);
-    telemetryMonitorInterval = null;
-  }
-
-  if (wsHeartbeatInterval) {
-    clearInterval(wsHeartbeatInterval);
-    wsHeartbeatInterval = null;
-  }
-
-  // Stop the telemetry scheduler, wait for MongoDB (MONGODB_SHUTDOWN_WAIT_MS
-  // is read at call time), and perform the final flush. When MongoDB is
-  // unavailable the pending records are written to the recovery file AND
-  // retained in the buffer so nothing is silently lost.
   await telemetryBuffer.shutdown();
-  if (wsUpgradeLimitsCleanupInterval) {
-    clearInterval(wsUpgradeLimitsCleanupInterval);
-    wsUpgradeLimitsCleanupInterval = null;
-  }
+  if (wsUpgradeLimitsCleanupInterval) { clearInterval(wsUpgradeLimitsCleanupInterval); wsUpgradeLimitsCleanupInterval = null; }
+  if (driverStateSweepInterval) { clearInterval(driverStateSweepInterval); driverStateSweepInterval = null; }
 
-  if (driverStateSweepInterval) {
-    clearInterval(driverStateSweepInterval);
-    driverStateSweepInterval = null;
-  }
-
-  // Close the distributed location fan-out: unsubscribe and release the
-  // dedicated Redis subscriber connection. Done regardless of whether the WS
-  // server itself was ever started.
   if (locationEventBus) {
     await locationEventBus.close();
     locationEventBus = null;
   }
 
-  if (!wsServer) {
-    return;
-  }
-
+  if (!wsServer) return;
   const serverToClose = wsServer;
   wsServer = null;
 
   await new Promise((resolve) => {
     serverToClose.clients?.forEach((client) => {
-      try {
-        client.close(1001, 'Server shutting down');
-      } catch (err) {
-        logger.error({ err }, '[shutdown] Failed to close WebSocket client');
-      }
+      try { client.close(1001, 'Server shutting down'); } catch (err) { logger.error({ err }, '[shutdown] Failed to close WebSocket client'); }
     });
-
     serverToClose.close((err) => {
-      if (err) {
-        logger.error('[shutdown] WebSocket server close error:', err.message);
-      }
+      if (err) logger.error('[shutdown] WebSocket server close error:', err.message);
       resolve();
     });
   });
 }
 
+// =====================================================================
+// MILESTONE & ETA PUBLISHING
+// =====================================================================
 export function broadcastOrderMilestone(orderDisplayId, milestone, status) {
   if (!orderDisplayId) return;
-
   const payload = JSON.stringify({
     event: 'milestone_update',
-    data: {
-      order_display_id: orderDisplayId,
-      milestone,
-      status,
-      timestamp: new Date().toISOString(),
-    },
+    data: { order_display_id: orderDisplayId, milestone, status, timestamp: new Date().toISOString() },
   });
 
   initRedisTrackerPubSub();
-
   if (redisClient) {
-    const pubSubMessage = JSON.stringify({ orderDisplayId, payload });
-    redisClient.publish(TRACKER_CHANNELS.MILESTONE, pubSubMessage).catch((err) => {
+    redisClient.publish(TRACKER_CHANNELS.MILESTONE, JSON.stringify({ orderDisplayId, payload })).catch((err) => {
       logger.error({ err }, '[Tracker] Redis publish error for milestone');
       deliverToLocalSubscribers(orderDisplayId, payload);
     });
@@ -1487,21 +1092,14 @@ export function broadcastOrderMilestone(orderDisplayId, milestone, status) {
 
 export function broadcastOrderEta(orderDisplayId, eta) {
   if (!orderDisplayId || !eta) return;
-
   const payload = JSON.stringify({
     event: 'eta_update',
-    data: {
-      order_display_id: orderDisplayId,
-      eta,
-      timestamp: new Date().toISOString(),
-    },
+    data: { order_display_id: orderDisplayId, eta, timestamp: new Date().toISOString() },
   });
 
   initRedisTrackerPubSub();
-
   if (redisClient) {
-    const pubSubMessage = JSON.stringify({ orderDisplayId, payload });
-    redisClient.publish(TRACKER_CHANNELS.ETA, pubSubMessage).catch((err) => {
+    redisClient.publish(TRACKER_CHANNELS.ETA, JSON.stringify({ orderDisplayId, payload })).catch((err) => {
       logger.error({ err }, '[Tracker] Redis publish error for ETA');
       deliverToLocalSubscribers(orderDisplayId, payload);
     });
@@ -1510,6 +1108,9 @@ export function broadcastOrderEta(orderDisplayId, eta) {
   }
 }
 
+// =====================================================================
+// SUBSCRIPTION HANDLING
+// =====================================================================
 export async function handleSubscribe(ws, data) {
   const { order_display_id, driver_id } = data;
   const targetId = order_display_id || driver_id;
@@ -1518,16 +1119,11 @@ export async function handleSubscribe(ws, data) {
     return ws.send(JSON.stringify({ error: 'Subscription target (order_display_id or driver_id) is missing.' }));
   }
 
-  const authorized = await canSubscribe(ws, { order_display_id, driver_id });
-
-  if (!authorized) {
+  if (!(await canSubscribe(ws, { order_display_id, driver_id }))) {
     return ws.send(JSON.stringify({ error: 'Forbidden: You are not authorized to subscribe to this tracking target.' }));
   }
 
-  if (!trackingSubscriptions.has(targetId)) {
-    trackingSubscriptions.set(targetId, new Set());
-  }
-
+  if (!trackingSubscriptions.has(targetId)) trackingSubscriptions.set(targetId, new Set());
   trackingSubscriptions.get(targetId).add(ws);
   ws.subscriptionTargets ??= new Set();
   ws.subscriptionTargets.add(targetId);
@@ -1544,58 +1140,26 @@ export async function handleSubscribe(ws, data) {
     }
   }
 
-  logger.info({ targetId }, 'Client subscribed to telemetry updates');
   ws.send(JSON.stringify({ status: 'subscribed', target: targetId, reconnect_supported: true }));
 }
 
 async function canSubscribe(ws, { order_display_id, driver_id }) {
   const userId = ws.user?.id || ws.driverId;
   const userRole = ws.user?.role;
-
-  if (!userId) {
-    return false;
-  }
+  if (!userId) return false;
 
   if (driver_id) {
-    // The driver may always subscribe to their own telemetry.
-    if (driver_id === userId || driver_id === ws.driverId) {
-      return true;
-    }
-
-    // Non-driver subscribers (customers) must have an active order with the
-    // target driver, mirroring the relationship check used for order_display_id.
+    if (driver_id === userId || driver_id === ws.driverId) return true;
     if (_orderRepository && userRole === 'customer') {
-      const { data: linkedOrder, error } = await _orderRepository.findActiveOrderForDriverByCustomer(
-        userId,
-        driver_id,
-        'id, order_display_id'
-      );
-
-      if (!error && linkedOrder) {
-        return true;
-      }
+      const { data: linkedOrder, error } = await _orderRepository.findActiveOrderForDriverByCustomer(userId, driver_id, 'id, order_display_id');
+      if (!error && linkedOrder) return true;
     }
-
     return false;
   }
 
-  if (!order_display_id || !_orderRepository) {
-    return false;
-  }
-
+  if (!order_display_id || !_orderRepository) return false;
   const { data: order, error } = await _orderRepository.findOrderByDisplayId(order_display_id, 'customer_id, driver_id');
-
-  if (error || !order) {
-    return false;
-  }
-
-  if (userRole === 'customer') {
-    return order.customer_id === userId;
-  }
-
-  if (userRole === 'driver') {
-    return order.driver_id === userId;
-  }
+  if (error || !order) return false;
 
   return order.customer_id === userId || order.driver_id === userId;
 }
@@ -1611,17 +1175,12 @@ async function handleUnsubscribe(ws, data) {
     if (redisClient) {
       const subscriberId = ws.user?.id || ws.driverId;
       try {
-        if (subscriberId) {
-          await redisClient.srem(`user:subscriptions:${subscriberId}`, targetId);
-        }
+        if (subscriberId) await redisClient.srem(`user:subscriptions:${subscriberId}`, targetId);
       } catch (err) {
         logger.error({ err }, 'Redis subscription cleanup error');
       }
     }
 
-    // Clean up Supabase Realtime channel when the last subscriber for this
-    // display ID disconnects. Without this, channels for driver-only orders
-    // (where only the driver subscribes) are never removed, leaking channels.
     if (trackingSubscriptions.get(targetId).size === 0) {
       trackingSubscriptions.delete(targetId);
       const channelKeys = displayIdToLocationChannelKeys.get(targetId);
@@ -1629,42 +1188,30 @@ async function handleUnsubscribe(ws, data) {
         for (const uuidKey of channelKeys) {
           if (locationChannels.has(uuidKey)) {
             const channel = locationChannels.get(uuidKey);
-            if (supabase) {
-              supabase.removeChannel(channel);
-            }
+            if (supabase) supabase.removeChannel(channel);
             locationChannels.delete(uuidKey);
-            logger.info({ uuidKey }, 'Removed Supabase Realtime channel on last subscriber unsubscribe');
           }
         }
         displayIdToLocationChannelKeys.delete(targetId);
       }
     }
 
-    logger.info({ targetId }, 'Client unsubscribed from updates');
     ws.send(JSON.stringify({ status: 'unsubscribed', target: targetId }));
   }
 }
 
 async function removeClientFromAllSubscriptions(ws) {
   trackingSubscriptions.forEach((clients, key) => {
-    if (clients.has(ws)) {
-      clients.delete(ws);
-      logger.info({ key }, 'Removed socket subscription due to disconnect');
-    }
+    if (clients.has(ws)) clients.delete(ws);
     if (clients.size === 0) {
       trackingSubscriptions.delete(key);
-      // Clean up cached Supabase Realtime channels associated with this
-      // subscription key via the reverse index so channels do not leak.
       const channelKeys = displayIdToLocationChannelKeys.get(key);
       if (channelKeys) {
         for (const uuidKey of channelKeys) {
           if (locationChannels.has(uuidKey)) {
             const channel = locationChannels.get(uuidKey);
-            if (supabase) {
-              supabase.removeChannel(channel);
-            }
+            if (supabase) supabase.removeChannel(channel);
             locationChannels.delete(uuidKey);
-            logger.info({ uuidKey }, 'Removed Supabase Realtime channel on last subscriber disconnect');
           }
         }
         displayIdToLocationChannelKeys.delete(key);
@@ -1672,31 +1219,18 @@ async function removeClientFromAllSubscriptions(ws) {
     }
   });
 
-  // Clean up the in-memory circuit breaker state so disconnected
-  // drivers do not cause unbounded memory growth. This runs regardless
-  // of Redis availability since consecutiveDropCount is always in-memory.
-  if (ws.driverId) {
-    consecutiveDropCount.delete(ws.driverId);
-  }
-
-  // Drop this socket's message rate-limit state on disconnect instead of
-  // relying on GC (the previous WeakMap approach), so memory stays bounded.
-  if (ws.socketId) {
-    messageRateTracker.delete(ws.socketId);
-  }
+  if (ws.driverId) consecutiveDropCount.delete(ws.driverId);
+  if (ws.socketId) messageRateTracker.delete(ws.socketId);
 
   if (redisClient) {
     const subscriberId = ws.user?.id || ws.driverId;
     if (subscriberId) {
       let hasOtherSockets = false;
-      if (wsServer && wsServer.clients) {
+      if (wsServer?.clients) {
         for (const client of wsServer.clients) {
-          if (client !== ws && client.readyState === 1) {
-            const clientUserId = client.user?.id || client.driverId;
-            if (clientUserId === subscriberId) {
-              hasOtherSockets = true;
-              break;
-            }
+          if (client !== ws && client.readyState === 1 && (client.user?.id || client.driverId) === subscriberId) {
+            hasOtherSockets = true;
+            break;
           }
         }
       }
@@ -1706,8 +1240,6 @@ async function removeClientFromAllSubscriptions(ws) {
         } catch (err) {
           logger.error({ err }, 'Redis subscription expire error on disconnect');
         }
-        // Invalidate the driver→order cache when the last socket for this
-        // driver disconnects so a stale mapping does not persist.
         await invalidateDriverOrderCache(subscriberId);
       }
     }
@@ -1721,16 +1253,11 @@ async function removeDriverLocationChannels(driverId) {
   for (const uuidKey of channelKeys) {
     const channel = locationChannels.get(uuidKey);
     if (channel) {
-      if (supabase) {
-        supabase.removeChannel(channel);
-      }
+      if (supabase) supabase.removeChannel(channel);
       locationChannels.delete(uuidKey);
     }
-    // Also drop the orderUUID from the displayId reverse index.
     displayIdToLocationChannelKeys.forEach((set, displayId) => {
-      if (set.delete(uuidKey) && set.size === 0) {
-        displayIdToLocationChannelKeys.delete(displayId);
-      }
+      if (set.delete(uuidKey) && set.size === 0) displayIdToLocationChannelKeys.delete(displayId);
     });
   }
   driverToLocationChannels.delete(driverId);
@@ -1742,12 +1269,9 @@ async function restoreSubscriptions(ws) {
 
   try {
     const targets = await redisClient.smembers(`user:subscriptions:${subscriberId}`);
-
     ws.subscriptionTargets ??= new Set();
 
-    if (targets.length > 0) {
-      await redisClient.persist(`user:subscriptions:${subscriberId}`);
-    }
+    if (targets.length > 0) await redisClient.persist(`user:subscriptions:${subscriberId}`);
 
     for (const targetId of targets) {
       const allowed = await canSubscribe(
@@ -1762,10 +1286,7 @@ async function restoreSubscriptions(ws) {
         continue;
       }
 
-      if (!trackingSubscriptions.has(targetId)) {
-        trackingSubscriptions.set(targetId, new Set());
-      }
-
+      if (!trackingSubscriptions.has(targetId)) trackingSubscriptions.set(targetId, new Set());
       trackingSubscriptions.get(targetId).add(ws);
       ws.subscriptionTargets.add(targetId);
     }
@@ -1774,60 +1295,29 @@ async function restoreSubscriptions(ws) {
   }
 }
 
+// =====================================================================
+// EXPORT FOR TESTING
+// =====================================================================
 export const __testing = {
-  resetTrackingSubscriptions() {
-    trackingSubscriptions.clear();
-  },
-  setOrderRepository(repo) {
-    _orderRepository = repo;
-  },
-  async restoreSubscriptions(ws) {
-    await restoreSubscriptions(ws);
-  },
-  getTrackingSubscriptions() {
-    return trackingSubscriptions;
-  },
-  setTrackingSubscriptions(map) {
-    trackingSubscriptions = map;
-  },
-  setLocationEventBus(bus) {
-    locationEventBus = bus;
-  },
-  getLocationEventBus() {
-    return locationEventBus;
-  },
+  resetTrackingSubscriptions() { trackingSubscriptions.clear(); },
+  setOrderRepository(repo) { _orderRepository = repo; },
+  async restoreSubscriptions(ws) { await restoreSubscriptions(ws); },
+  getTrackingSubscriptions() { return trackingSubscriptions; },
+  setTrackingSubscriptions(map) { trackingSubscriptions = map; },
+  setLocationEventBus(bus) { locationEventBus = bus; },
+  getLocationEventBus() { return locationEventBus; },
   createLocationEventHandler,
-  getLocationEventBusMetrics() {
-    return locationEventBus ? locationEventBus.getMetrics() : null;
-  },
-  flushTelemetryBuffer() {
-    return telemetryBuffer._test.flush();
-  },
+  getLocationEventBusMetrics() { return locationEventBus ? locationEventBus.getMetrics() : null; },
+  flushTelemetryBuffer() { return telemetryBuffer._test.flush(); },
   removeClientFromAllSubscriptions,
-  getTelemetryWriteBuffer() {
-    return telemetryBuffer._test.getBuffer();
-  },
-  getTelemetryFlushBuffer() {
-    return telemetryBuffer._test.getRetryQueue();
-  },
-  async setTelemetryWriteBuffer(records) {
-    await telemetryBuffer._test.setBuffer(records);
-  },
-  setTelemetryFlushBuffer(records) {
-    telemetryBuffer._test.setRetryQueue(records);
-  },
-  async pushToTelemetryWriteBuffer(records) {
-    await telemetryBuffer._test.push(records);
-  },
-  async clearTelemetryWriteBuffer() {
-    await telemetryBuffer._test.clearBuffer();
-  },
-  clearTelemetryFlushBuffer() {
-    telemetryBuffer._test.setRetryQueue([]);
-  },
-  getTelemetryBufferMetrics() {
-    return telemetryBuffer.getMetrics();
-  },
+  getTelemetryWriteBuffer() { return telemetryBuffer._test.getBuffer(); },
+  getTelemetryFlushBuffer() { return telemetryBuffer._test.getRetryQueue(); },
+  async setTelemetryWriteBuffer(records) { await telemetryBuffer._test.setBuffer(records); },
+  setTelemetryFlushBuffer(records) { telemetryBuffer._test.setRetryQueue(records); },
+  async pushToTelemetryWriteBuffer(records) { await telemetryBuffer._test.push(records); },
+  async clearTelemetryWriteBuffer() { await telemetryBuffer._test.clearBuffer(); },
+  clearTelemetryFlushBuffer() { telemetryBuffer._test.setRetryQueue([]); },
+  getTelemetryBufferMetrics() { return telemetryBuffer.getMetrics(); },
   getShutdownState() {
     const state = {
       isSchedulerActive,
@@ -1835,14 +1325,10 @@ export const __testing = {
       hasWebSocketServer: Boolean(wsServer),
       hasWsHeartbeatInterval: Boolean(wsHeartbeatInterval),
     };
-    // Expose live (not snapshot) distributed fan-out state so the health check
-    // can report whether Redis Pub/Sub is operational.
     Object.defineProperty(state, 'pubSub', {
       enumerable: true,
       configurable: true,
-      get() {
-        return locationEventBus ? locationEventBus.getState() : null;
-      },
+      get() { return locationEventBus ? locationEventBus.getState() : null; },
     });
     return state;
   },
@@ -1852,41 +1338,19 @@ export const __testing = {
     wsServer = server;
     isSchedulerActive = Boolean(telemetryInterval);
   },
-  setMongoDbOverride(val) {
-    telemetryBuffer._test.setMongoDbOverride(val);
-  },
-  getConsecutiveDropCount(driverId) {
-    const entry = consecutiveDropCount.get(driverId);
-    return entry ? entry.count : 0;
-  },
-  clearConsecutiveDropCount() {
-    consecutiveDropCount.clear();
-  },
-  getConsecutiveDropCountSize() {
-    return consecutiveDropCount.size;
-  },
-  getConsecutiveDropCountEntry(driverId) {
-    return consecutiveDropCount.get(driverId) || null;
-  },
-  getDriverStateTtlMs() {
-    return TRACKER_DRIVER_STATE_TTL_MS;
-  },
+  setMongoDbOverride(val) { telemetryBuffer._test.setMongoDbOverride(val); },
+  getConsecutiveDropCount(driverId) { const entry = consecutiveDropCount.get(driverId); return entry ? entry.count : 0; },
+  clearConsecutiveDropCount() { consecutiveDropCount.clear(); },
+  getConsecutiveDropCountSize() { return consecutiveDropCount.size; },
+  getConsecutiveDropCountEntry(driverId) { return consecutiveDropCount.get(driverId) || null; },
+  getDriverStateTtlMs() { return TRACKER_DRIVER_STATE_TTL_MS; },
   sweepStaleDriverState,
-  setLastDriverStateSweep(val) {
-    lastDriverStateSweep = val;
-  },
-  get MAX_CONSECUTIVE_DROPS() {
-    return MAX_CONSECUTIVE_DROPS;
-  },
+  setLastDriverStateSweep(val) { lastDriverStateSweep = val; },
+  get MAX_CONSECUTIVE_DROPS() { return MAX_CONSECUTIVE_DROPS; },
   WS_MAX_PAYLOAD_BYTES,
-  // ── Driver order cache helpers (for testing) ──────────────────────
   getCachedDriverOrder,
   setCachedDriverOrder,
   invalidateDriverOrderCache,
   DRIVER_ORDER_CACHE_KEY_PREFIX,
   DRIVER_ORDER_CACHE_TTL_SECONDS,
 };
-
-// Fix: implemented exponential backoff (retry count * 1000ms) for Supabase channel reconnects.
-
-// Resolves #2045: Cache channels per orderUUID
