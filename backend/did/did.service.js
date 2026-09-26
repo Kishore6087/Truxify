@@ -31,10 +31,13 @@ function base58btc(input) {
 
 class DIDService {
     constructor() {
-        this.provider = new ethers.JsonRpcProvider(process.env.POLYGON_RPC_URL);
-        this.wallet = new ethers.Wallet(process.env.PRIVATE_KEY, this.provider);
-        this.didRegistryAddress = process.env.DID_REGISTRY_ADDRESS;
-        this.identityWalletAddress = process.env.IDENTITY_WALLET_ADDRESS;
+        this.provider = null;
+        this.wallet = null;
+        this.didRegistry = null;
+        this.identityWallet = null;
+        this.didRegistryAddress = null;
+        this.identityWalletAddress = null;
+        this.isInitialized = false;
 
         this.didRegistryABI = [
             'function createDID(string memory did) external',
@@ -62,20 +65,59 @@ class DIDService {
             'function getCredentials(address owner) external view returns (bytes32[])',
             'function isWalletActive(address owner) external view returns (bool)'
         ];
+    }
 
-        this.didRegistry = new ethers.Contract(
-            this.didRegistryAddress,
-            this.didRegistryABI,
-            this.wallet
-        );
+    /**
+     * Lazily initializes ethers provider, wallet, and contract clients on-demand.
+     * Prevents API server crash on import when environment variables are unset.
+     */
+    _ensureInitialized() {
+        if (this.isInitialized) {
+            return;
+        }
 
-        this.identityWallet = new ethers.Contract(
-            this.identityWalletAddress,
-            this.identityWalletABI,
-            this.wallet
-        );
+        const privateKey = process.env.PRIVATE_KEY || process.env.RELAYER_WALLET_PRIVATE_KEY;
+        const rpcUrl = process.env.POLYGON_RPC_URL || process.env.RPC_URL;
+        this.didRegistryAddress = process.env.DID_REGISTRY_ADDRESS;
+        this.identityWalletAddress = process.env.IDENTITY_WALLET_ADDRESS;
 
-        logger.info('✅ DID Service initialized');
+        if (!privateKey) {
+            throw new Error(
+                'DIDService configuration error: PRIVATE_KEY or RELAYER_WALLET_PRIVATE_KEY environment variable is missing.'
+            );
+        }
+
+        if (!this.didRegistryAddress || !this.identityWalletAddress) {
+            throw new Error(
+                'DIDService configuration error: DID_REGISTRY_ADDRESS or IDENTITY_WALLET_ADDRESS environment variable is missing.'
+            );
+        }
+
+        try {
+            this.provider = rpcUrl
+                ? new ethers.JsonRpcProvider(rpcUrl)
+                : ethers.getDefaultProvider('homestead');
+
+            this.wallet = new ethers.Wallet(privateKey, this.provider);
+
+            this.didRegistry = new ethers.Contract(
+                this.didRegistryAddress,
+                this.didRegistryABI,
+                this.wallet
+            );
+
+            this.identityWallet = new ethers.Contract(
+                this.identityWalletAddress,
+                this.identityWalletABI,
+                this.wallet
+            );
+
+            this.isInitialized = true;
+            logger.info('✅ DID Service blockchain clients initialized successfully');
+        } catch (error) {
+            logger.error('Failed to initialize DIDService ethers clients:', error);
+            throw error;
+        }
     }
 
     _validateCredentialData(data) {
@@ -87,6 +129,8 @@ class DIDService {
     }
 
     async createDID(userAddress, publicKey) {
+        this._ensureInitialized();
+
         try {
             const did = `did:truxify:${uuidv4()}`;
 
@@ -155,6 +199,8 @@ class DIDService {
     }
 
     async addServiceEndpoint(did, id, type, endpoint, description) {
+        this._ensureInitialized();
+
         try {
             const tx = await this.didRegistry.addServiceEndpoint(did, id, type, endpoint, description);
             await tx.wait();
@@ -166,6 +212,8 @@ class DIDService {
     }
 
     async addVerificationMethod(did, id, type, controller, publicKey) {
+        this._ensureInitialized();
+
         try {
             const tx = await this.didRegistry.addVerificationMethod(did, id, type, controller, publicKey);
             await tx.wait();
@@ -177,6 +225,8 @@ class DIDService {
     }
 
     async issueCredential(subject, credentialType, schema, validUntil) {
+        this._ensureInitialized();
+
         try {
             const schemaHash = ethers.keccak256(ethers.toUtf8Bytes(JSON.stringify(schema)));
             const proof = this.generateProof(subject, credentialType, schema);
@@ -218,9 +268,7 @@ class DIDService {
                 }
             }
 
-            // 3. Fallback: reproduce abi.encodePacked(block.timestamp, msg.sender,
-            // subject, credentialType, nonce) matching DIDRegistry.sol exactly,
-            // and verify against on-chain proofHash to prevent nonce race conditions
+            // 3. Fallback: reproduce abi.encodePacked(block.timestamp, msg.sender, subject, credentialType, nonce)
             if (!credentialId) {
                 const block = await this.provider.getBlock(receipt.blockNumber);
                 const currentNonce = await this.didRegistry.issuerNonces(this.wallet.address);
@@ -273,6 +321,8 @@ class DIDService {
     }
 
     async verifyCredential(credentialId) {
+        this._ensureInitialized();
+
         try {
             const isValid = await this.didRegistry.verifyCredential(credentialId);
             const credential = await this.didRegistry.getCredential(credentialId);
@@ -297,6 +347,8 @@ class DIDService {
     }
 
     async revokeCredential(credentialId) {
+        this._ensureInitialized();
+
         try {
             const tx = await this.didRegistry.revokeCredential(credentialId);
             const receipt = await tx.wait();
@@ -319,6 +371,8 @@ class DIDService {
     }
 
     async getDID(did) {
+        this._ensureInitialized();
+
         try {
             const didData = await this.didRegistry.getDID(did);
             return { did, owner: didData[0], isActive: didData[2], createdAt: didData[3].toString(), updatedAt: didData[4].toString() };
@@ -329,6 +383,8 @@ class DIDService {
     }
 
     async getWallet(address) {
+        this._ensureInitialized();
+
         try {
             const walletData = await this.identityWallet.getWallet(address);
             return { owner: walletData[0], did: walletData[1], credentials: walletData[2], isActive: walletData[3] };
@@ -339,6 +395,8 @@ class DIDService {
     }
 
     async getCredentials(address) {
+        this._ensureInitialized();
+
         try {
             const credentials = await this.identityWallet.getCredentials(address);
             const credDetails = [];
