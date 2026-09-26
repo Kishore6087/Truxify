@@ -6,6 +6,11 @@ const model = (mongoose?.model || mongoose?.default?.model || (() => ({}))).bind
 
 const clamp = (val, min, max) => Math.min(Math.max(val, min), max);
 
+const clampCoordinate = (val, min, max) => {
+  const num = typeof val === "string" && val.trim() !== "" ? Number(val) : val;
+  return typeof num === "number" && !isNaN(num) ? clamp(num, min, max) : val;
+};
+
 const gpsLogSchema = new Schema(
   {
     bookingId: { type: String, required: true, index: true },
@@ -15,14 +20,14 @@ const gpsLogSchema = new Schema(
       required: true,
       min: [-90, "Latitude must be between -90 and 90"],
       max: [90, "Latitude must be between -90 and 90"],
-      set: (val) => (typeof val === "number" ? clamp(val, -90, 90) : val),
+      set: (val) => clampCoordinate(val, -90, 90),
     },
     lng: {
       type: Number,
       required: true,
       min: [-180, "Longitude must be between -180 and 180"],
       max: [180, "Longitude must be between -180 and 180"],
-      set: (val) => (typeof val === "number" ? clamp(val, -180, 180) : val),
+      set: (val) => clampCoordinate(val, -180, 180),
     },
     speed:     { type: Number, default: null },
     heading:   { type: Number, default: null },
